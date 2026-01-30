@@ -84,30 +84,55 @@ function extractExports(content) {
 function extractImports(content, filePath) {
   const imports = [];
   
-  const importRegex = /import\s+(?:(?:\*\s+as\s+(\w+))|(?:\{([^}]+)\})|(\w+)|(?:\s*,\s*\{([^}]+)\}))?)\s+from\s+['"](.+?)['"]/g;
+  const namespaceImportRegex = /import\s+\*\s+as\s+(\w+)\s+from\s+['"](.+?)['"]/g;
+  const defaultImportRegex = /import\s+(\w+)\s+from\s+['"](.+?)['"]/g;
+  const namedImportRegex = /import\s+\{([^}]+)\}\s+from\s+['"](.+?)['"]/g;
+  const mixedImportRegex = /import\s+(\w+)\s*,\s*\{([^}]+)\}\s+from\s+['"](.+?)['"]/g;
   const requireRegex = /require\s*\(\s*['"](.+?)['"]\s*\)/g;
   const dynamicImportRegex = /import\s*\(\s*['"](.+?)['"]\s*\)/g;
   
   let match;
-  while ((match = importRegex.exec(content)) !== null) {
-    const namespace = match[1];
-    const namedImports = match[2] || match[4];
-    const defaultImport = match[3];
-    const modulePath = match[5] || match[6];
-    
-    const resolved = resolveImport(filePath, modulePath);
+  
+  while ((match = namespaceImportRegex.exec(content)) !== null) {
+    const resolved = resolveImport(filePath, match[2]);
+    if (resolved && resolved.startsWith(srcDir)) {
+      imports.push({ file: resolved, items: [{ type: 'namespace', name: match[1] }] });
+    }
+  }
+  
+  while ((match = mixedImportRegex.exec(content)) !== null) {
+    const resolved = resolveImport(filePath, match[3]);
+    if (resolved && resolved.startsWith(srcDir)) {
+      const importedItems = [{ type: 'default', name: match[1] }];
+      match[2].split(',').forEach(item => {
+        const parts = item.trim().split(/\s+as\s+/);
+        const originalName = parts[0].trim();
+        const alias = parts[1] ? parts[1].trim() : originalName;
+        importedItems.push({ type: 'named', name: alias, originalName });
+      });
+      imports.push({ file: resolved, items: importedItems });
+    }
+  }
+  
+  while ((match = defaultImportRegex.exec(content)) !== null) {
+    if (!match[0].includes('{') && !match[0].includes('*')) {
+      const resolved = resolveImport(filePath, match[2]);
+      if (resolved && resolved.startsWith(srcDir)) {
+        imports.push({ file: resolved, items: [{ type: 'default', name: match[1] }] });
+      }
+    }
+  }
+  
+  while ((match = namedImportRegex.exec(content)) !== null) {
+    const resolved = resolveImport(filePath, match[2]);
     if (resolved && resolved.startsWith(srcDir)) {
       const importedItems = [];
-      if (namespace) importedItems.push({ type: 'namespace', name: namespace });
-      if (defaultImport) importedItems.push({ type: 'default', name: defaultImport });
-      if (namedImports) {
-        namedImports.split(',').forEach(item => {
-          const parts = item.trim().split(/\s+as\s+/);
-          const originalName = parts[0].trim();
-          const alias = parts[1] ? parts[1].trim() : originalName;
-          importedItems.push({ type: 'named', name: alias, originalName });
-        });
-      }
+      match[1].split(',').forEach(item => {
+        const parts = item.trim().split(/\s+as\s+/);
+        const originalName = parts[0].trim();
+        const alias = parts[1] ? parts[1].trim() : originalName;
+        importedItems.push({ type: 'named', name: alias, originalName });
+      });
       imports.push({ file: resolved, items: importedItems });
     }
   }
@@ -130,24 +155,52 @@ function extractImports(content, filePath) {
 }
 
 function checkUsage(content, importName, isNamespace) {
+  const importLineRegex = new RegExp(`import\\s+.*?\\b${importName}\\b.*?from`, 'g');
+  
   if (isNamespace) {
-    const regex = new RegExp(`\\b${importName}\\.`, 'g');
-    return regex.test(content);
+    const namespaceUsageRegex = new RegExp(`\\b${importName}\\.`, 'g');
+    return namespaceUsageRegex.test(content);
   } else {
-    const regex = new RegExp(`\\b${importName}\\b`, 'g');
-    const matches = content.match(regex);
-    if (!matches) return false;
+    const lines = content.split('\n');
+    let importLineIndex = -1;
     
-    const importRegex = new RegExp(`import\\s+.*?\\b${importName}\\b.*?from`, 'g');
-    const exportRegex = new RegExp(`export\\s+.*?\\b${importName}\\b`, 'g');
+    for (let i = 0; i < lines.length; i++) {
+      if (importLineRegex.test(lines[i])) {
+        importLineIndex = i;
+        break;
+      }
+    }
     
-    let importCount = 0;
-    let exportCount = 0;
-    let match;
-    while ((match = importRegex.exec(content)) !== null) importCount++;
-    while ((match = exportRegex.exec(content)) !== null) exportCount++;
+    if (importLineIndex === -1) return false;
     
-    return matches.length > (importCount + exportCount);
+    const contentAfterImport = lines.slice(importLineIndex + 1).join('\n');
+    
+    const importLineRegex2 = new RegExp(`import\\s+.*?\\b${importName}\\b.*?from`, 'g');
+    const importCount = (content.match(importLineRegex2) || []).length;
+    
+    const functionCallRegex = new RegExp(`\\b${importName}\\s*\\(`, 'g');
+    const propertyAccessRegex = new RegExp(`\\b${importName}\\.`, 'g');
+    const assignmentRegex = new RegExp(`\\b${importName}\\s*=`, 'g');
+    const destructuringRegex = new RegExp(`\\b${importName}\\s*[,}]`, 'g');
+    const typeAnnotationRegex = new RegExp(`:\\s*${importName}\\b`, 'g');
+    const returnStatementRegex = new RegExp(`return\\s+${importName}\\b`, 'g');
+    const awaitStatementRegex = new RegExp(`await\\s+${importName}\\b`, 'g');
+    const methodCallRegex = new RegExp(`\\.(use|get|post|put|delete|patch)\\s*\\(\\s*${importName}\\b`, 'g');
+    const constVarRegex = new RegExp(`const\\s+\\w+\\s*=\\s*${importName}\\b`, 'g');
+    
+    const functionCalls = (contentAfterImport.match(functionCallRegex) || []).length;
+    const propertyAccess = (contentAfterImport.match(propertyAccessRegex) || []).length;
+    const assignments = (contentAfterImport.match(assignmentRegex) || []).length;
+    const destructuring = (contentAfterImport.match(destructuringRegex) || []).length;
+    const typeAnnotations = (contentAfterImport.match(typeAnnotationRegex) || []).length;
+    const returnStatements = (contentAfterImport.match(returnStatementRegex) || []).length;
+    const awaitStatements = (contentAfterImport.match(awaitStatementRegex) || []).length;
+    const methodCalls = (contentAfterImport.match(methodCallRegex) || []).length;
+    const constVars = (contentAfterImport.match(constVarRegex) || []).length;
+    
+    const totalUsage = functionCalls + propertyAccess + assignments + destructuring + typeAnnotations + returnStatements + awaitStatements + methodCalls + constVars;
+    
+    return totalUsage > importCount;
   }
 }
 
